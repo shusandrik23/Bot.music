@@ -135,6 +135,26 @@ CLEAN_HINT = (
 )
 
 
+def _parse_json(text: str | None):
+    """Parse model output as JSON, tolerating ```json fences and extra text around it."""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty response")
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        data = json.loads(raw[start : end + 1])
+    if isinstance(data, list):  # model sometimes wraps the object
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        raise ValueError("JSON is not an object")
+    return data
+
+
 class ServiceError(Exception):
     """User-facing error (message is shown in the chat)."""
 
@@ -208,21 +228,23 @@ class MusicService:
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             temperature=temperature,
+            http_options=types.HttpOptions(timeout=60_000),  # ms
         )
         last_exc: Exception | None = None
+        reason = ""
         attempt = 0
         while attempt < 3:
             attempt += 1
             model = self.model
             try:
                 async with self._gemini_sem:
-                    resp = await self.gemini.aio.models.generate_content(
-                        model=model, contents=prompt, config=config
+                    resp = await asyncio.wait_for(
+                        self.gemini.aio.models.generate_content(
+                            model=model, contents=prompt, config=config
+                        ),
+                        timeout=75,
                     )
-                data = json.loads(resp.text or "{}")
-                if isinstance(data, list):  # model sometimes wraps the object
-                    data = data[0] if data else {}
-                return data
+                return _parse_json(resp.text)
             except genai_errors.APIError as exc:
                 last_exc = exc
                 code = getattr(exc, "code", None)
@@ -251,11 +273,27 @@ class MusicService:
                     raise ServiceError(
                         "Лимит бесплатного Gemini API исчерпан. Попробуйте через минуту 🙏"
                     ) from exc
+                reason = f"Gemini {code}: {getattr(exc, 'message', '') or text}"
+                if code and code >= 500 and attempt >= 2 and self._next_model():
+                    continue  # model overloaded: try another one
                 await asyncio.sleep(2)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+                reason = f"{model} не ответила за 75 секунд"
+                log.warning("Gemini timeout (model %s, attempt %s)", model, attempt)
             except (json.JSONDecodeError, ValueError) as exc:
                 last_exc = exc
+                reason = "нейросеть вернула ответ не в том формате"
                 log.warning("Gemini returned invalid JSON (attempt %s): %s", attempt, exc)
-        raise ServiceError("Не получилось связаться с нейросетью, попробуйте ещё раз.") from last_exc
+            except Exception as exc:  # network errors etc.
+                last_exc = exc
+                reason = f"{type(exc).__name__}: {exc}"
+                log.warning("Gemini call failed (model %s, attempt %s): %r", model, attempt, exc)
+                await asyncio.sleep(2)
+        raise ServiceError(
+            "Не получилось связаться с нейросетью, попробуйте ещё раз."
+            + (f"\nПричина: {reason[:200]}" if reason else "")
+        ) from last_exc
 
     def _next_model(self) -> bool:
         """Move to the next fallback model; False when none are left."""
