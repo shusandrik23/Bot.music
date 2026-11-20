@@ -7,7 +7,9 @@ thread via asyncio.to_thread and never blocks the bot's event loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -72,6 +74,17 @@ def _init_sync() -> None:
                 user_id INTEGER PRIMARY KEY,
                 mode    TEXT,
                 topic   TEXT
+            );
+            CREATE TABLE IF NOT EXISTS spotify_tokens (
+                user_id      INTEGER PRIMARY KEY,
+                token_json   TEXT,
+                spotify_id   TEXT DEFAULT '',
+                display_name TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                state      TEXT PRIMARY KEY,
+                user_id    INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -170,3 +183,81 @@ async def get_active_subscriptions(min_per_day: int) -> list[Subscription]:
         "all",
     )
     return [Subscription(r[0], r[1], r[2] or "", r[3], bool(r[4])) for r in rows]
+
+
+async def seen_track_ids_ordered(user_id: int, limit: int = 100) -> list[str]:
+    rows = await asyncio.to_thread(
+        _execute,
+        "SELECT track_id FROM seen_tracks WHERE user_id = ? ORDER BY seen_at DESC LIMIT ?",
+        (user_id, limit),
+        "all",
+    )
+    return [r[0] for r in rows]
+
+
+# ---------- Spotify user OAuth ----------
+# Sync variants are used by spotipy's cache handler (always called from a worker thread).
+
+def get_token_sync(user_id: int) -> dict | None:
+    row = _execute("SELECT token_json FROM spotify_tokens WHERE user_id = ?", (user_id,), "one")
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+
+
+def save_token_sync(user_id: int, token: dict) -> None:
+    _execute(
+        "INSERT INTO spotify_tokens (user_id, token_json) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET token_json = excluded.token_json",
+        (user_id, json.dumps(token)),
+    )
+
+
+async def set_spotify_profile(user_id: int, spotify_id: str, display_name: str) -> None:
+    await asyncio.to_thread(
+        _execute,
+        "UPDATE spotify_tokens SET spotify_id = ?, display_name = ? WHERE user_id = ?",
+        (spotify_id, display_name, user_id),
+    )
+
+
+async def get_spotify_profile(user_id: int) -> tuple[str, str] | None:
+    """(spotify_id, display_name) if the user connected Spotify."""
+    row = await asyncio.to_thread(
+        _execute,
+        "SELECT spotify_id, display_name FROM spotify_tokens "
+        "WHERE user_id = ? AND token_json IS NOT NULL AND spotify_id != ''",
+        (user_id,),
+        "one",
+    )
+    return (row[0], row[1] or row[0]) if row else None
+
+
+async def delete_spotify_token(user_id: int) -> None:
+    await asyncio.to_thread(_execute, "DELETE FROM spotify_tokens WHERE user_id = ?", (user_id,))
+
+
+async def create_oauth_state(user_id: int) -> str:
+    state = secrets.token_urlsafe(24)
+    await asyncio.to_thread(
+        _execute, "DELETE FROM oauth_states WHERE created_at < datetime('now', '-1 day')"
+    )
+    await asyncio.to_thread(
+        _execute, "INSERT INTO oauth_states (state, user_id) VALUES (?, ?)", (state, user_id)
+    )
+    return state
+
+
+async def pop_oauth_state(state: str) -> int | None:
+    row = await asyncio.to_thread(
+        _execute,
+        "SELECT user_id FROM oauth_states WHERE state = ? "
+        "AND created_at >= datetime('now', '-1 hour')",
+        (state,),
+        "one",
+    )
+    await asyncio.to_thread(_execute, "DELETE FROM oauth_states WHERE state = ?", (state,))
+    return row[0] if row else None

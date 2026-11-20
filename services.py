@@ -123,6 +123,7 @@ ROUTER_PROMPT = """Определи, какую музыку хочет поль
 - story: песня с интересной историей создания или скрытым смыслом (topic = уточнение или пусто)
 - refs: музыка из фильмов, сериалов, игр, книг или про атмосферу/тему (topic = тема)
 - random: случайный/неожиданный трек (topic = пусто)
+- playlist: пользователь просит СОЗДАТЬ/собрать плейлист (topic = описание плейлиста целиком, с количеством треков, если указано)
 Если запрос не подходит ни под один режим, но связан с музыкой или настроением — выбери refs.
 Запрос пользователя: «{text}»
 Ответ JSON: {{"mode": "...", "topic": "..."}}"""
@@ -226,6 +227,8 @@ class MusicService:
         data = await self._ask_json(ROUTER_PROMPT.format(text=text[:500]), temperature=0.0)
         mode = str(data.get("mode", "refs")).strip().lower()
         topic = str(data.get("topic", "") or "").strip()
+        if mode == "playlist":
+            return mode, topic or text
         if mode not in MODES:
             mode, topic = "refs", text
         if mode == "random":
