@@ -163,7 +163,7 @@ class PlaylistService:
     async def _client(self, user_id: int) -> spotipy.Spotify:
         if not await self.is_connected(user_id):
             raise ServiceError("Сначала подключите Spotify: /connect")
-        return spotipy.Spotify(auth_manager=self._oauth(user_id), requests_timeout=20, retries=3)
+        return spotipy.Spotify(auth_manager=self._oauth(user_id), requests_timeout=15, retries=2, status_retries=0)
 
     @staticmethod
     async def _call(fn, *args, **kwargs):
