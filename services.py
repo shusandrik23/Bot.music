@@ -186,6 +186,10 @@ class MusicService:
         model: str = "gemini-2.5-flash",
     ) -> None:
         self.model = model
+        # Tried in order if the configured model is retired / not found.
+        self._fallback_models = [
+            m for m in ("gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest") if m != model
+        ]
         self.gemini = genai.Client(api_key=gemini_api_key)
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyClientCredentials(
@@ -206,11 +210,14 @@ class MusicService:
             temperature=temperature,
         )
         last_exc: Exception | None = None
-        for attempt in range(2):
+        attempt = 0
+        while attempt < 3:
+            attempt += 1
+            model = self.model
             try:
                 async with self._gemini_sem:
                     resp = await self.gemini.aio.models.generate_content(
-                        model=self.model, contents=prompt, config=config
+                        model=model, contents=prompt, config=config
                     )
                 data = json.loads(resp.text or "{}")
                 if isinstance(data, list):  # model sometimes wraps the object
@@ -218,16 +225,47 @@ class MusicService:
                 return data
             except genai_errors.APIError as exc:
                 last_exc = exc
-                log.warning("Gemini API error (attempt %s): %s", attempt + 1, exc)
-                if getattr(exc, "code", None) == 429:
+                code = getattr(exc, "code", None)
+                text = str(exc)
+                log.warning("Gemini API error (model %s, attempt %s): %s", model, attempt, text)
+                if code == 404 or "is not found" in text or "not supported" in text:
+                    # Model retired or unavailable: switch to the next one and retry.
+                    if self._next_model():
+                        attempt -= 1
+                        continue
+                    raise ServiceError(
+                        "Модель Gemini недоступна. Укажите актуальную модель в переменной "
+                        "GEMINI_MODEL (например, gemini-flash-latest)."
+                    ) from exc
+                if "API_KEY_INVALID" in text or "API key not valid" in text or code in (401, 403):
+                    raise ServiceError(
+                        "Gemini не принимает ключ. Проверьте переменную GEMINI_API_KEY "
+                        "(без пробелов и кавычек) или создайте новый ключ на aistudio.google.com/apikey."
+                    ) from exc
+                if "location is not supported" in text.lower() or "FAILED_PRECONDITION" in text:
+                    raise ServiceError(
+                        "Gemini недоступен из региона сервера. Пересоздайте сервис на Render "
+                        "в регионе Oregon (US West)."
+                    ) from exc
+                if code == 429:
                     raise ServiceError(
                         "Лимит бесплатного Gemini API исчерпан. Попробуйте через минуту 🙏"
                     ) from exc
                 await asyncio.sleep(2)
             except (json.JSONDecodeError, ValueError) as exc:
                 last_exc = exc
-                log.warning("Gemini returned invalid JSON (attempt %s): %s", attempt + 1, exc)
+                log.warning("Gemini returned invalid JSON (attempt %s): %s", attempt, exc)
         raise ServiceError("Не получилось связаться с нейросетью, попробуйте ещё раз.") from last_exc
+
+    def _next_model(self) -> bool:
+        """Move to the next fallback model; False when none are left."""
+        while self._fallback_models:
+            candidate = self._fallback_models.pop(0)
+            if candidate != self.model:
+                log.warning("Switching Gemini model %s -> %s", self.model, candidate)
+                self.model = candidate
+                return True
+        return False
 
     async def route_intent(self, text: str) -> tuple[str, str]:
         data = await self._ask_json(ROUTER_PROMPT.format(text=text[:500]), temperature=0.0)
