@@ -10,7 +10,7 @@ import asyncio
 import html
 import logging
 import os
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -110,7 +110,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [(MODES["hits"], "mode:hits"), (MODES["story"], "mode:story")],
         [(MODES["refs"], "mode:refs")],
         [(MODES["random"], "mode:random")],
-        [("🎶 Плейлисты Spotify", "pl_menu")],
+        [("🎶 Плейлисты Spotify", "pl_menu"), ("🕘 История", "hist:0")],
         [("⏰ Ежедневная рассылка (1-3 в день)", "sub_menu")],
         [("⚙️ Настройки", "settings")],
     ])
@@ -216,7 +216,7 @@ async def deliver(bot: Bot, chat_id: int, user_id: int, mode: str, topic: str) -
             )
             return
 
-        await db.add_seen(user_id, card.track_id, card.label)
+        await db.add_seen(user_id, card.track_id, card.label, mode, topic)
         await db.set_last_request(user_id, mode, topic)
         await _safe_delete(status)
         await send_card(bot, chat_id, card)
@@ -255,6 +255,7 @@ async def cmd_help(message: Message) -> None:
         "Команды:\n/start — главное меню\n/random — случайный трек\n"
         "/subscribe — ежедневная рассылка\n/playlists — плейлисты Spotify\n"
         "/settings — настройки (фильтр нецензурной лексики)\n"
+        "/history — история треков (или просто напишите «история»)\n"
         "/connect — подключить Spotify\n/disconnect — отключить Spotify\n\n"
         "Пришлите ссылку на плейлист Spotify — я его проанализирую.\n"
         "Или просто напишите запрос текстом: «главные хиты 1985», «песня с "
@@ -686,6 +687,105 @@ async def spotify_callback(request: web.Request) -> web.Response:
     )
 
 
+# ------------------------------------------------------------------ history
+
+HISTORY_PAGE = 10
+HISTORY_WORDS = {"история", "/история", "моя история", "история треков", "🕘 история"}
+
+
+def _fmt_seen_at(raw: str) -> str:
+    """SQLite UTC timestamp -> local 'DD.MM HH:MM' (TIMEZONE_OFFSET)."""
+    try:
+        dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ""
+    return dt.astimezone(TZ).strftime("%d.%m.%y %H:%M")
+
+
+async def history_view(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total = await db.count_history(user_id)
+    if total == 0:
+        return (
+            "🕘 <b>История пуста</b>\n\nЗдесь будут все треки, которые я вам присылал. "
+            "Выберите режим в меню, чтобы начать 🎧",
+            kb([[("🔙 В главное меню", "menu")]]),
+        )
+    pages = (total + HISTORY_PAGE - 1) // HISTORY_PAGE
+    page = max(0, min(page, pages - 1))
+    items = await db.get_history(user_id, HISTORY_PAGE, page * HISTORY_PAGE)
+
+    e = html.escape
+    lines = [f"🕘 <b>История треков</b> · {_plural_tracks(total)} · стр. {page + 1}/{pages}"]
+    for n, it in enumerate(items, page * HISTORY_PAGE + 1):
+        url = f"https://open.spotify.com/track/{it.track_id}"
+        label = it.label or "Трек"
+        meta = [topic_title(it.mode, it.topic)] if it.mode else []
+        when = _fmt_seen_at(it.seen_at)
+        if when:
+            meta.append(when)
+        line = f'<b>{n}.</b> <a href="{e(url)}">{e(_cut(label, 80))}</a>'
+        if meta:
+            line += f"\n      <i>{e(' · '.join(meta))}</i>"
+        lines.append(line)
+
+    nav = []
+    if page > 0:
+        nav.append(("◀️ Новее", f"hist:{page - 1}"))
+    if page < pages - 1:
+        nav.append(("Старше ▶️", f"hist:{page + 1}"))
+    rows = [nav] if nav else []
+    rows.append([("💾 Сохранить в плейлист Spotify", "pl_seen")])
+    rows.append([("🗑 Очистить историю", "hist_clear"), ("🔙 В меню", "menu")])
+    return "\n\n".join(lines), kb(rows)
+
+
+@router.message(Command("history"))
+@router.message(F.text.func(lambda t: t.strip().lower() in HISTORY_WORDS))
+async def cmd_history(message: Message) -> None:
+    pending_input.pop(message.from_user.id, None)
+    text, markup = await history_view(message.from_user.id, 0)
+    await message.answer(text, reply_markup=markup, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+
+@router.callback_query(F.data.startswith("hist:"))
+async def cb_history(cq: CallbackQuery) -> None:
+    await cq.answer()
+    try:
+        page = int(cq.data.split(":", 1)[1])
+    except ValueError:
+        page = 0
+    text, markup = await history_view(cq.from_user.id, page)
+    no_preview = LinkPreviewOptions(is_disabled=True)
+    if not (cq.message.text or "").startswith("🕘 История треков"):
+        # Opened from a menu/track card: send a new message instead of replacing it.
+        await cq.message.answer(text, reply_markup=markup, link_preview_options=no_preview)
+        return
+    try:
+        await cq.message.edit_text(text, reply_markup=markup, link_preview_options=no_preview)
+    except TelegramBadRequest:
+        pass  # message not modified
+
+
+@router.callback_query(F.data == "hist_clear")
+async def cb_history_clear(cq: CallbackQuery) -> None:
+    await cq.answer()
+    await cq.message.answer(
+        "🗑 Удалить всю историю?\n\n<i>После очистки я забуду, какие треки уже присылал, "
+        "и они могут попадаться снова.</i>",
+        reply_markup=kb([[("Да, удалить", "hist_clear_yes"), ("Отмена", "hist:0")]]),
+    )
+
+
+@router.callback_query(F.data == "hist_clear_yes")
+async def cb_history_clear_yes(cq: CallbackQuery) -> None:
+    await db.clear_history(cq.from_user.id)
+    await cq.answer("История очищена")
+    try:
+        await cq.message.edit_text("🗑 История очищена.", reply_markup=main_menu_kb())
+    except TelegramBadRequest:
+        await cq.message.answer("🗑 История очищена.", reply_markup=main_menu_kb())
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
@@ -772,7 +872,7 @@ async def send_digest(bot: Bot, min_per_day: int) -> None:
                     break
                 except TelegramRetryAfter as exc:
                     await asyncio.sleep(exc.retry_after + 1)
-            await db.add_seen(sub.user_id, card.track_id, card.label)
+            await db.add_seen(sub.user_id, card.track_id, card.label, sub.mode, sub.topic)
         except TelegramForbiddenError:
             log.info("User %s blocked the bot — deactivating subscription", sub.user_id)
             await db.set_subscription_active(sub.user_id, False)

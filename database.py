@@ -92,6 +92,11 @@ def _init_sync() -> None:
             );
             """
         )
+        # Migration for databases created before the history feature.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(seen_tracks)")}
+        for col in ("mode", "topic"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE seen_tracks ADD COLUMN {col} TEXT DEFAULT ''")
         conn.commit()
 
 
@@ -120,12 +125,48 @@ async def recent_labels(user_id: int, limit: int = 25) -> list[str]:
     return [r[0] for r in rows]
 
 
-async def add_seen(user_id: int, track_id: str, label: str = "") -> None:
+async def add_seen(
+    user_id: int, track_id: str, label: str = "", mode: str = "", topic: str = ""
+) -> None:
     await asyncio.to_thread(
         _execute,
-        "INSERT OR IGNORE INTO seen_tracks (user_id, track_id, label) VALUES (?, ?, ?)",
-        (user_id, track_id, label),
+        "INSERT OR IGNORE INTO seen_tracks (user_id, track_id, label, mode, topic) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, track_id, label, mode, topic),
     )
+
+
+# ---------- history (/history) ----------
+
+@dataclass
+class HistoryItem:
+    track_id: str
+    label: str
+    mode: str
+    topic: str
+    seen_at: str  # UTC, "YYYY-MM-DD HH:MM:SS"
+
+
+async def count_history(user_id: int) -> int:
+    row = await asyncio.to_thread(
+        _execute, "SELECT COUNT(*) FROM seen_tracks WHERE user_id = ?", (user_id,), "one"
+    )
+    return row[0] if row else 0
+
+
+async def get_history(user_id: int, limit: int = 10, offset: int = 0) -> list[HistoryItem]:
+    rows = await asyncio.to_thread(
+        _execute,
+        "SELECT track_id, label, mode, topic, seen_at FROM seen_tracks WHERE user_id = ? "
+        "ORDER BY seen_at DESC, rowid DESC LIMIT ? OFFSET ?",
+        (user_id, limit, offset),
+        "all",
+    )
+    return [HistoryItem(r[0], r[1] or "", r[2] or "", r[3] or "", r[4] or "") for r in rows]
+
+
+async def clear_history(user_id: int) -> None:
+    await asyncio.to_thread(_execute, "DELETE FROM seen_tracks WHERE user_id = ?", (user_id,))
 
 
 # ---------- last request ("🔄 Ещё так же") ----------
@@ -192,7 +233,7 @@ async def get_active_subscriptions(min_per_day: int) -> list[Subscription]:
 async def seen_track_ids_ordered(user_id: int, limit: int = 100) -> list[str]:
     rows = await asyncio.to_thread(
         _execute,
-        "SELECT track_id FROM seen_tracks WHERE user_id = ? ORDER BY seen_at DESC LIMIT ?",
+        "SELECT track_id FROM seen_tracks WHERE user_id = ? ORDER BY seen_at DESC, rowid DESC LIMIT ?",
         (user_id, limit),
         "all",
     )
