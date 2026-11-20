@@ -183,12 +183,12 @@ class MusicService:
         gemini_api_key: str,
         spotify_client_id: str,
         spotify_client_secret: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.8-flash",
     ) -> None:
         self.model = model
         # Tried in order if the configured model is retired / not found.
         self._fallback_models = [
-            m for m in ("gemini-flash-latest", "gemini-2.5-flash", "gemini-flash-lite-latest") if m != model
+            m for m in ("gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest") if m != model
         ]
         self.gemini = genai.Client(api_key=gemini_api_key)
         self.sp = spotipy.Spotify(
@@ -235,7 +235,7 @@ class MusicService:
                         continue
                     raise ServiceError(
                         "Модель Gemini недоступна. Укажите актуальную модель в переменной "
-                        "GEMINI_MODEL (например, gemini-flash-latest)."
+                        "GEMINI_MODEL (например, gemini-3.8-flash)."
                     ) from exc
                 if "API_KEY_INVALID" in text or "API key not valid" in text or code in (401, 403):
                     raise ServiceError(

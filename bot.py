@@ -54,7 +54,7 @@ service = MusicService(
     gemini_api_key=_require("GEMINI_API_KEY"),
     spotify_client_id=_require("SPOTIFY_CLIENT_ID"),
     spotify_client_secret=_require("SPOTIFY_CLIENT_SECRET"),
-    model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    model=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
 )
 playlists = PlaylistService(
     music=service,
