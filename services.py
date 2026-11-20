@@ -15,6 +15,7 @@ import json
 import logging
 import random
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -135,6 +136,11 @@ CLEAN_HINT = (
 )
 
 
+_EXCLUDED_MODEL_RE = re.compile(
+    r"image|tts|audio|live|embed|vision|exp|preview|thinking|computer|robotics|native|8b|001$"
+)
+
+
 def _parse_json(text: str | None):
     """Parse model output as JSON, tolerating ```json fences and extra text around it."""
     raw = (text or "").strip()
@@ -206,10 +212,9 @@ class MusicService:
         model: str = "gemini-3.8-flash",
     ) -> None:
         self.model = model
-        # Tried in order if the configured model is retired / not found.
-        self._fallback_models = [
-            m for m in ("gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest") if m != model
-        ]
+        self._chain: list[str] | None = None  # discovered lazily from the API
+        self._dead_models: set[str] = set()  # 404: retired / not available to this key
+        self._cooldown: dict[str, float] = {}  # model -> monotonic time it may be retried
         self.gemini = genai.Client(api_key=gemini_api_key)
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyClientCredentials(
@@ -223,6 +228,36 @@ class MusicService:
 
     # ------------------------------------------------------------------ Gemini
 
+    async def _model_chain(self) -> list[str]:
+        """Configured model first, then flash models this API key can actually use."""
+        if self._chain is None:
+            chain = [self.model]
+            try:
+                found = []
+                pager = await self.gemini.aio.models.list(config={"page_size": 100})
+                async for m in pager:
+                    name = (m.name or "").removeprefix("models/")
+                    actions = m.supported_actions or []
+                    if (
+                        "flash" in name
+                        and (not actions or "generateContent" in actions)
+                        and not _EXCLUDED_MODEL_RE.search(name)
+                    ):
+                        found.append(name)
+
+                def rank(name: str):
+                    ver = re.search(r"(\d+(?:\.\d+)?)", name)
+                    return ("lite" in name, -(float(ver.group(1)) if ver else 0.0), "latest" in name, name)
+
+                for name in sorted(set(found), key=rank):
+                    if name not in chain:
+                        chain.append(name)
+            except Exception as exc:
+                log.warning("Could not list Gemini models: %r", exc)
+            self._chain = chain
+            log.info("Gemini model chain: %s", ", ".join(chain))
+        return self._chain
+
     async def _ask_json(self, prompt: str, temperature: float) -> dict:
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
@@ -230,80 +265,88 @@ class MusicService:
             temperature=temperature,
             http_options=types.HttpOptions(timeout=60_000),  # ms
         )
-        last_exc: Exception | None = None
-        reason = ""
-        attempt = 0
-        while attempt < 3:
-            attempt += 1
-            model = self.model
-            try:
-                async with self._gemini_sem:
-                    resp = await asyncio.wait_for(
-                        self.gemini.aio.models.generate_content(
-                            model=model, contents=prompt, config=config
-                        ),
-                        timeout=75,
-                    )
-                return _parse_json(resp.text)
-            except genai_errors.APIError as exc:
-                last_exc = exc
-                code = getattr(exc, "code", None)
-                text = str(exc)
-                log.warning("Gemini API error (model %s, attempt %s): %s", model, attempt, text)
-                if code == 404 or "is not found" in text or "not supported" in text:
-                    # Model retired or unavailable: switch to the next one and retry.
-                    if self._next_model():
-                        attempt -= 1
-                        continue
-                    raise ServiceError(
-                        "Модель Gemini недоступна. Укажите актуальную модель в переменной "
-                        "GEMINI_MODEL (например, gemini-3.8-flash)."
-                    ) from exc
-                if "API_KEY_INVALID" in text or "API key not valid" in text or code in (401, 403):
-                    raise ServiceError(
-                        "Gemini не принимает ключ. Проверьте переменную GEMINI_API_KEY "
-                        "(без пробелов и кавычек) или создайте новый ключ на aistudio.google.com/apikey."
-                    ) from exc
-                if "location is not supported" in text.lower() or "FAILED_PRECONDITION" in text:
-                    raise ServiceError(
-                        "Gemini недоступен из региона сервера. Пересоздайте сервис на Render "
-                        "в регионе Oregon (US West)."
-                    ) from exc
-                if code == 429:
-                    raise ServiceError(
-                        "Лимит бесплатного Gemini API исчерпан. Попробуйте через минуту 🙏"
-                    ) from exc
-                reason = f"Gemini {code}: {getattr(exc, 'message', '') or text}"
-                if code and code >= 500 and attempt >= 2 and self._next_model():
-                    continue  # model overloaded: try another one
-                await asyncio.sleep(2)
-            except asyncio.TimeoutError as exc:
-                last_exc = exc
-                reason = f"{model} не ответила за 75 секунд"
-                log.warning("Gemini timeout (model %s, attempt %s)", model, attempt)
-            except (json.JSONDecodeError, ValueError) as exc:
-                last_exc = exc
-                reason = "нейросеть вернула ответ не в том формате"
-                log.warning("Gemini returned invalid JSON (attempt %s): %s", attempt, exc)
-            except Exception as exc:  # network errors etc.
-                last_exc = exc
-                reason = f"{type(exc).__name__}: {exc}"
-                log.warning("Gemini call failed (model %s, attempt %s): %r", model, attempt, exc)
-                await asyncio.sleep(2)
-        raise ServiceError(
-            "Не получилось связаться с нейросетью, попробуйте ещё раз."
-            + (f"\nПричина: {reason[:200]}" if reason else "")
-        ) from last_exc
+        chain = [m for m in await self._model_chain() if m not in self._dead_models]
+        now = time.monotonic()
+        ready = [m for m in chain if self._cooldown.get(m, 0) <= now]
+        # Models on cooldown (recently overloaded) go last, not away.
+        candidates = (ready + [m for m in chain if m not in ready])[:4]
+        if not candidates:
+            raise ServiceError(
+                "Нет доступных моделей Gemini для этого ключа. Укажите модель в переменной "
+                "GEMINI_MODEL или создайте новый ключ на aistudio.google.com/apikey."
+            )
 
-    def _next_model(self) -> bool:
-        """Move to the next fallback model; False when none are left."""
-        while self._fallback_models:
-            candidate = self._fallback_models.pop(0)
-            if candidate != self.model:
-                log.warning("Switching Gemini model %s -> %s", self.model, candidate)
-                self.model = candidate
-                return True
-        return False
+        reasons: list[str] = []
+        last_exc: Exception | None = None
+        for model in candidates:
+            for attempt in (1, 2):
+                try:
+                    async with self._gemini_sem:
+                        resp = await asyncio.wait_for(
+                            self.gemini.aio.models.generate_content(
+                                model=model, contents=prompt, config=config
+                            ),
+                            timeout=75,
+                        )
+                    data = _parse_json(resp.text)
+                    self._cooldown.pop(model, None)
+                    return data
+                except genai_errors.APIError as exc:
+                    last_exc = exc
+                    code = getattr(exc, "code", None)
+                    text = str(exc)
+                    message = getattr(exc, "message", "") or text
+                    log.warning("Gemini API error (model %s, attempt %s): %s", model, attempt, text)
+                    if "API_KEY_INVALID" in text or "API key not valid" in text or code in (401, 403):
+                        raise ServiceError(
+                            "Gemini не принимает ключ. Проверьте переменную GEMINI_API_KEY "
+                            "(без пробелов и кавычек) или создайте новый ключ на aistudio.google.com/apikey."
+                        ) from exc
+                    if "location is not supported" in text.lower():
+                        raise ServiceError(
+                            "Gemini недоступен из региона сервера. Пересоздайте сервис на Render "
+                            "в регионе Oregon (US West)."
+                        ) from exc
+                    if code == 404:
+                        self._dead_models.add(model)  # retired / unknown: never try again
+                        reasons.append(f"{model}: не найдена")
+                        break
+                    if code == 429:
+                        # Free-tier quotas are per model: try the next one.
+                        self._cooldown[model] = time.monotonic() + 60
+                        reasons.append(f"{model}: лимит запросов")
+                        break
+                    if code and code >= 500:
+                        if attempt == 1:
+                            await asyncio.sleep(1.5)
+                            continue
+                        self._cooldown[model] = time.monotonic() + 60
+                        reasons.append(f"{model}: перегружена")
+                        break
+                    reasons.append(f"{model}: {code} {message[:120]}")
+                    break
+                except asyncio.TimeoutError as exc:
+                    last_exc = exc
+                    log.warning("Gemini timeout (model %s, attempt %s)", model, attempt)
+                    reasons.append(f"{model}: не ответила вовремя")
+                    break
+                except (json.JSONDecodeError, ValueError) as exc:
+                    last_exc = exc
+                    log.warning("Gemini returned invalid JSON (model %s): %s", model, exc)
+                    if attempt == 2:
+                        reasons.append(f"{model}: ответ не в формате JSON")
+                except Exception as exc:  # network errors etc.
+                    last_exc = exc
+                    log.warning("Gemini call failed (model %s): %r", model, exc)
+                    reasons.append(f"{model}: {type(exc).__name__}")
+                    break
+
+        if reasons and all("лимит" in r for r in reasons):
+            raise ServiceError("Лимит бесплатного Gemini API исчерпан. Попробуйте через минуту 🙏") from last_exc
+        raise ServiceError(
+            "Не получилось связаться с нейросетью, попробуйте ещё раз через минуту."
+            + ("\nПричина: " + "; ".join(reasons)[:300] if reasons else "")
+        ) from last_exc
 
     async def route_intent(self, text: str) -> tuple[str, str]:
         data = await self._ask_json(ROUTER_PROMPT.format(text=text[:500]), temperature=0.0)
