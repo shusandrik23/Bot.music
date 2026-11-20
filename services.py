@@ -136,6 +136,9 @@ CLEAN_HINT = (
 )
 
 
+GEMINI_CALL_TIMEOUT = 25.0  # seconds per request
+GEMINI_TOTAL_BUDGET = 75.0  # seconds for all models/attempts of one question
+
 _EXCLUDED_MODEL_RE = re.compile(
     r"image|tts|audio|live|embed|vision|exp|preview|thinking|computer|robotics|native|8b|001$"
 )
@@ -215,13 +218,16 @@ class MusicService:
         self._chain: list[str] | None = None  # discovered lazily from the API
         self._dead_models: set[str] = set()  # 404: retired / not available to this key
         self._cooldown: dict[str, float] = {}  # model -> monotonic time it may be retried
+        self._no_thinking_cfg: set[str] = set()  # models that reject thinking_config
+        self._spotify_blocked_until = 0.0  # Spotify asked us to slow down (HTTP 429)
         self.gemini = genai.Client(api_key=gemini_api_key)
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyClientCredentials(
                 client_id=spotify_client_id, client_secret=spotify_client_secret
             ),
-            requests_timeout=15,
-            retries=3,
+            requests_timeout=10,
+            retries=2,
+            status_retries=0,  # don't sleep for Spotify's Retry-After (can be hours)
         )
         # Free Gemini tier is ~15 RPM: keep concurrent calls low.
         self._gemini_sem = asyncio.Semaphore(3)
@@ -258,13 +264,24 @@ class MusicService:
             log.info("Gemini model chain: %s", ", ".join(chain))
         return self._chain
 
-    async def _ask_json(self, prompt: str, temperature: float) -> dict:
-        config = types.GenerateContentConfig(
+    def _gen_config(self, model: str, temperature: float) -> types.GenerateContentConfig:
+        thinking = None
+        if model not in self._no_thinking_cfg:
+            # Long "thinking" makes answers take tens of seconds; music tips don't need it.
+            if "gemini-3" in model:
+                thinking = types.ThinkingConfig(thinking_level="low")
+            elif "gemini-2.5-flash" in model:
+                thinking = types.ThinkingConfig(thinking_budget=0)
+        return types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             temperature=temperature,
-            http_options=types.HttpOptions(timeout=60_000),  # ms
+            thinking_config=thinking,
+            http_options=types.HttpOptions(timeout=int(GEMINI_CALL_TIMEOUT * 1000)),
         )
+
+    async def _ask_json(self, prompt: str, temperature: float) -> dict:
+        deadline = time.monotonic() + GEMINI_TOTAL_BUDGET
         chain = [m for m in await self._model_chain() if m not in self._dead_models]
         now = time.monotonic()
         ready = [m for m in chain if self._cooldown.get(m, 0) <= now]
@@ -280,14 +297,22 @@ class MusicService:
         last_exc: Exception | None = None
         for model in candidates:
             for attempt in (1, 2):
+                remaining = deadline - time.monotonic()
+                if remaining < 5:
+                    reasons.append("общее время ожидания истекло")
+                    break
+                started = time.monotonic()
                 try:
                     async with self._gemini_sem:
                         resp = await asyncio.wait_for(
                             self.gemini.aio.models.generate_content(
-                                model=model, contents=prompt, config=config
+                                model=model,
+                                contents=prompt,
+                                config=self._gen_config(model, temperature),
                             ),
-                            timeout=75,
+                            timeout=min(GEMINI_CALL_TIMEOUT, remaining),
                         )
+                    log.info("Gemini %s answered in %.1fs", model, time.monotonic() - started)
                     data = _parse_json(resp.text)
                     self._cooldown.pop(model, None)
                     return data
@@ -307,6 +332,10 @@ class MusicService:
                             "Gemini недоступен из региона сервера. Пересоздайте сервис на Render "
                             "в регионе Oregon (US West)."
                         ) from exc
+                    if code == 400 and "think" in text.lower() and model not in self._no_thinking_cfg:
+                        # This model does not accept our thinking settings: retry without them.
+                        self._no_thinking_cfg.add(model)
+                        continue
                     if code == 404:
                         self._dead_models.add(model)  # retired / unknown: never try again
                         reasons.append(f"{model}: не найдена")
@@ -315,6 +344,11 @@ class MusicService:
                         # Free-tier quotas are per model: try the next one.
                         self._cooldown[model] = time.monotonic() + 60
                         reasons.append(f"{model}: лимит запросов")
+                        break
+                    if code == 504 or "DEADLINE_EXCEEDED" in text:
+                        # The model is too slow right now: don't wait for it twice.
+                        self._cooldown[model] = time.monotonic() + 120
+                        reasons.append(f"{model}: не успела ответить")
                         break
                     if code and code >= 500:
                         if attempt == 1:
@@ -327,6 +361,7 @@ class MusicService:
                     break
                 except asyncio.TimeoutError as exc:
                     last_exc = exc
+                    self._cooldown[model] = time.monotonic() + 120
                     log.warning("Gemini timeout (model %s, attempt %s)", model, attempt)
                     reasons.append(f"{model}: не ответила вовремя")
                     break
@@ -341,7 +376,7 @@ class MusicService:
                     reasons.append(f"{model}: {type(exc).__name__}")
                     break
 
-        if reasons and all("лимит" in r for r in reasons):
+        if reasons and all("лимит" in r for r in reasons if "время" not in r):
             raise ServiceError("Лимит бесплатного Gemini API исчерпан. Попробуйте через минуту 🙏") from last_exc
         raise ServiceError(
             "Не получилось связаться с нейросетью, попробуйте ещё раз через минуту."
@@ -367,9 +402,21 @@ class MusicService:
             res = self.sp.search(q=query, type="track", limit=limit, offset=offset)
             return (res or {}).get("tracks", {}).get("items", []) or []
 
+        if time.monotonic() < self._spotify_blocked_until:
+            return []
         try:
             return await asyncio.to_thread(_do)
-        except Exception as exc:  # spotipy raises various HTTP/network errors
+        except spotipy.SpotifyException as exc:
+            log.warning("Spotify search failed for %r: %s", query, exc)
+            if exc.http_status == 429 or "429" in str(exc):
+                retry_after = 60
+                try:
+                    retry_after = int((exc.headers or {}).get("Retry-After", 60))
+                except (TypeError, ValueError):
+                    pass
+                self._spotify_blocked_until = time.monotonic() + min(max(retry_after, 30), 3600)
+            return []
+        except Exception as exc:  # network errors etc.
             log.warning("Spotify search failed for %r: %s", query, exc)
             return []
 
@@ -432,6 +479,11 @@ class MusicService:
         else:
             card = await self._pick_first_found(candidates, seen, clean)
 
+        if card is None and time.monotonic() < self._spotify_blocked_until:
+            minutes = max(1, round((self._spotify_blocked_until - time.monotonic()) / 60))
+            raise ServiceError(
+                f"Spotify временно ограничил запросы бота. Попробуйте через ~{minutes} мин."
+            )
         if card is None:
             raise ServiceError(
                 "Не удалось найти подходящий новый трек в Spotify 😔 "

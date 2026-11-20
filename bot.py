@@ -88,6 +88,9 @@ SCHEDULE_TEXT = {
     3: "3 трека в день (10:00, 15:00 и 19:30)",
 }
 
+# Hard limit for one track pick (Gemini + Spotify), seconds
+PICK_TIMEOUT = 110
+
 # Modes waiting for free-text input after a submenu was opened: user_id -> mode
 pending_input: dict[int, str] = {}
 # One request at a time per user (protects from double clicks)
@@ -202,7 +205,17 @@ async def deliver(bot: Bot, chat_id: int, user_id: int, mode: str, topic: str) -
         status = await bot.send_message(chat_id, "🎧 Подбираю трек…")
         await bot.send_chat_action(chat_id, ChatAction.TYPING)
         try:
-            card = await service.pick(user_id, mode, topic)
+            card = await asyncio.wait_for(service.pick(user_id, mode, topic), timeout=PICK_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("pick() timed out for user %s (%s/%s)", user_id, mode, topic)
+            await _safe_delete(status)
+            await bot.send_message(
+                chat_id,
+                "😕 Слишком долго: нейросеть или Spotify сейчас не отвечают. Попробуйте через минуту.",
+                reply_markup=track_kb(),
+            )
+            await db.set_last_request(user_id, mode, topic)
+            return
         except ServiceError as exc:
             await _safe_delete(status)
             await bot.send_message(chat_id, f"😕 {html.escape(str(exc))}", reply_markup=track_kb())
@@ -865,7 +878,9 @@ async def send_digest(bot: Bot, min_per_day: int) -> None:
     log.info("Daily digest (per_day >= %s): %s subscribers", min_per_day, len(subs))
     for sub in subs:
         try:
-            card = await service.pick(sub.user_id, sub.mode, sub.topic)
+            card = await asyncio.wait_for(
+                service.pick(sub.user_id, sub.mode, sub.topic), timeout=PICK_TIMEOUT
+            )
             for attempt in range(2):
                 try:
                     await send_card(bot, sub.user_id, card, header="☀️ <b>Ваш трек дня</b>")
