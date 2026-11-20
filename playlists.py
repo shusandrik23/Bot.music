@@ -19,7 +19,7 @@ from spotipy.cache_handler import CacheHandler
 from spotipy.oauth2 import SpotifyOAuth
 
 import database as db
-from services import Candidate, MusicService, ServiceError
+from services import CLEAN_HINT, Candidate, MusicService, ServiceError
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,7 @@ class Analysis:
     top_artists: list[tuple[str, int]]
     decades: list[tuple[str, int]]
     avg_popularity: int | None
+    explicit: int = 0
     verdict: str = ""
     mood: str = ""
     genres: list[str] = field(default_factory=list)
@@ -187,10 +188,12 @@ class PlaylistService:
         data = await self._call(sp.current_user_playlists, limit=limit)
         return [p for p in (data or {}).get("items", []) if p]
 
-    async def _find_many(self, candidates: list[Candidate], exclude: set[str]) -> list[tuple[Candidate, dict | None]]:
+    async def _find_many(
+        self, candidates: list[Candidate], exclude: set[str], clean: bool = False
+    ) -> list[tuple[Candidate, dict | None]]:
         async def one(c: Candidate):
             async with self._search_sem:
-                return c, await self.music.find_track(c, exclude)
+                return c, await self.music.find_track(c, exclude, clean)
 
         return await asyncio.gather(*(one(c) for c in candidates))
 
@@ -209,12 +212,14 @@ class PlaylistService:
 
     async def create_from_prompt(self, user_id: int, request: str) -> PlaylistResult:
         sp = await self._client(user_id)
-        data = await self.music._ask_json(CREATE_PROMPT.format(request=request[:400]), temperature=0.9)
+        clean = await db.get_no_explicit(user_id)
+        prompt = CREATE_PROMPT.format(request=request[:400]) + (f"\n{CLEAN_HINT}" if clean else "")
+        data = await self.music._ask_json(prompt, temperature=0.9)
         candidates = MusicService._parse_candidates(data)[:50]
         if not candidates:
             raise ServiceError("Нейросеть не предложила треки, попробуйте переформулировать запрос.")
 
-        found = await self._find_many(candidates, set())
+        found = await self._find_many(candidates, set(), clean)
         ids, missing, used = [], [], set()
         for cand, item in found:
             if item and item["id"] not in used:
@@ -274,6 +279,7 @@ class PlaylistService:
             if year.isdigit():
                 decades[f"{year[:3]}0-е"] += 1
         pops = [t["popularity"] for t in tracks if isinstance(t.get("popularity"), int)]
+        clean = await db.get_no_explicit(user_id)
         duration = sum(t.get("duration_ms") or 0 for t in tracks)
 
         an = Analysis(
@@ -287,6 +293,7 @@ class PlaylistService:
             top_artists=artists.most_common(5),
             decades=sorted(decades.items(), key=lambda kv: -kv[1])[:5],
             avg_popularity=round(sum(pops) / len(pops)) if pops else None,
+            explicit=sum(1 for t in tracks if t.get("explicit")),
         )
 
         stats = (
@@ -301,7 +308,9 @@ class PlaylistService:
             year = str((t.get("album") or {}).get("release_date", ""))[:4]
             lines.append(f"{artist} — {t.get('name', '')} ({year})")
         data = await self.music._ask_json(
-            ANALYZE_PROMPT.format(name=an.name, stats=stats, tracks="\n".join(lines)), temperature=0.7
+            ANALYZE_PROMPT.format(name=an.name, stats=stats, tracks="\n".join(lines))
+            + (f"\n{CLEAN_HINT}" if clean else ""),
+            temperature=0.7,
         )
         an.verdict = str(data.get("verdict", "") or "")
         an.mood = str(data.get("mood", "") or "")
@@ -313,7 +322,7 @@ class PlaylistService:
             if isinstance(r, dict) and r.get("artist") and r.get("track"):
                 rec_cands.append(Candidate(str(r["artist"]), str(r["track"]), why=str(r.get("why", ""))))
         existing = {t["id"] for t in tracks}
-        for cand, item in await self._find_many(rec_cands[:8], existing):
+        for cand, item in await self._find_many(rec_cands[:8], existing, clean):
             if item and item["id"] not in existing:
                 existing.add(item["id"])
                 an.recs.append(

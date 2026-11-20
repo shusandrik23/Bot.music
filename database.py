@@ -81,6 +81,10 @@ def _init_sync() -> None:
                 spotify_id   TEXT DEFAULT '',
                 display_name TEXT DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id     INTEGER PRIMARY KEY,
+                no_explicit INTEGER DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS oauth_states (
                 state      TEXT PRIMARY KEY,
                 user_id    INTEGER,
@@ -193,6 +197,24 @@ async def seen_track_ids_ordered(user_id: int, limit: int = 100) -> list[str]:
         "all",
     )
     return [r[0] for r in rows]
+
+
+# ---------- user settings ----------
+
+async def get_no_explicit(user_id: int) -> bool:
+    row = await asyncio.to_thread(
+        _execute, "SELECT no_explicit FROM user_settings WHERE user_id = ?", (user_id,), "one"
+    )
+    return bool(row and row[0])
+
+
+async def set_no_explicit(user_id: int, value: bool) -> None:
+    await asyncio.to_thread(
+        _execute,
+        "INSERT INTO user_settings (user_id, no_explicit) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET no_explicit = excluded.no_explicit",
+        (user_id, 1 if value else 0),
+    )
 
 
 # ---------- Spotify user OAuth ----------

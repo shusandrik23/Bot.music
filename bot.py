@@ -112,6 +112,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [(MODES["random"], "mode:random")],
         [("🎶 Плейлисты Spotify", "pl_menu")],
         [("⏰ Ежедневная рассылка (1-3 в день)", "sub_menu")],
+        [("⚙️ Настройки", "settings")],
     ])
 
 
@@ -253,6 +254,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Команды:\n/start — главное меню\n/random — случайный трек\n"
         "/subscribe — ежедневная рассылка\n/playlists — плейлисты Spotify\n"
+        "/settings — настройки (фильтр нецензурной лексики)\n"
         "/connect — подключить Spotify\n/disconnect — отключить Spotify\n\n"
         "Пришлите ссылку на плейлист Spotify — я его проанализирую.\n"
         "Или просто напишите запрос текстом: «главные хиты 1985», «песня с "
@@ -566,6 +568,8 @@ def format_analysis(an: Analysis) -> str:
     if an.decades:
         stats.append("📅 Эпохи: " + " · ".join(
             f"{e(d)} {round(n * 100 / an.total)}%" for d, n in an.decades))
+    if an.explicit:
+        stats.append(f"🔞 С ненормативной лексикой: {an.explicit} из {an.total}")
     if an.avg_popularity is not None:
         stats.append(f"🔥 Средняя популярность: {an.avg_popularity}/100")
     if an.mood:
@@ -709,6 +713,49 @@ async def on_text(message: Message, bot: Bot) -> None:
         await create_playlist(bot, message.chat.id, user_id, topic)
         return
     await deliver(bot, message.chat.id, user_id, mode, topic)
+
+
+# ----------------------------------------------------------------- settings
+
+async def settings_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    on = await db.get_no_explicit(user_id)
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"🚫 Без нецензурной лексики: <b>{'включено ✅' if on else 'выключено'}</b>\n"
+        "<i>Когда включено, я не присылаю треки с пометкой Explicit — ни в подборках, "
+        "ни в рассылке, ни в создаваемых плейлистах и рекомендациях.</i>"
+    )
+    markup = kb([
+        [(f"{'☑️' if on else '⬜️'} Без нецензурной лексики", "toggle_explicit")],
+        [("🔙 В главное меню", "menu")],
+    ])
+    return text, markup
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message) -> None:
+    text, markup = await settings_view(message.from_user.id)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "settings")
+async def cb_settings(cq: CallbackQuery) -> None:
+    await cq.answer()
+    text, markup = await settings_view(cq.from_user.id)
+    await cq.message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "toggle_explicit")
+async def cb_toggle_explicit(cq: CallbackQuery) -> None:
+    user_id = cq.from_user.id
+    new_value = not await db.get_no_explicit(user_id)
+    await db.set_no_explicit(user_id, new_value)
+    await cq.answer("Фильтр включён ✅" if new_value else "Фильтр выключен")
+    text, markup = await settings_view(user_id)
+    try:
+        await cq.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        await cq.message.answer(text, reply_markup=markup)
 
 
 # ------------------------------------------------------------ daily digest

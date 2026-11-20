@@ -129,6 +129,12 @@ ROUTER_PROMPT = """Определи, какую музыку хочет поль
 Ответ JSON: {{"mode": "...", "topic": "..."}}"""
 
 
+CLEAN_HINT = (
+    "ВАЖНО: пользователь включил фильтр — предлагай только треки БЕЗ ненормативной "
+    "лексики (без пометки Explicit в Spotify)."
+)
+
+
 class ServiceError(Exception):
     """User-facing error (message is shown in the chat)."""
 
@@ -264,20 +270,25 @@ class MusicService:
         want, got = _norm(track), _norm(item.get("name", ""))
         return bool(want and got and (want in got or got in want))
 
-    async def find_track(self, cand: Candidate, seen: set[str]) -> dict | None:
-        """Exact field search first, then a simplified free-text fallback."""
+    async def find_track(self, cand: Candidate, seen: set[str], clean: bool = False) -> dict | None:
+        """Exact field search first, then a simplified free-text fallback.
+
+        clean=True skips tracks marked explicit by Spotify (profanity filter).
+        """
         artist, track = _clean_query_part(cand.artist), _clean_query_part(cand.track)
         if not track:
             return None
 
         items = await self._search(f"track:{track} artist:{artist}", limit=5)
         for it in items:
+            if clean and it.get("explicit"):
+                continue
             if it.get("id") not in seen and self._artist_matches(it, artist):
                 return it
 
         items = await self._search(f"{artist} {track}", limit=5)
         for it in items:
-            if it.get("id") in seen:
+            if it.get("id") in seen or (clean and it.get("explicit")):
                 continue
             if self._artist_matches(it, artist) or self._track_matches(it, track):
                 return it
@@ -289,17 +300,18 @@ class MusicService:
         if mode not in MODES:
             mode = "random"
         seen = await db.get_seen_ids(user_id)
+        clean = await db.get_no_explicit(user_id)
         avoid = await db.recent_labels(user_id)
 
-        prompt = self._build_prompt(mode, topic, avoid)
+        prompt = self._build_prompt(mode, topic, avoid, clean)
         data = await self._ask_json(prompt, TEMPERATURES[mode])
         intro = str(data.get("intro", "") or "").strip()
         candidates = self._parse_candidates(data)
 
         if mode == "hits":
-            card = await self._pick_hit(candidates, data.get("queries") or [], seen, topic)
+            card = await self._pick_hit(candidates, data.get("queries") or [], seen, topic, clean)
         else:
-            card = await self._pick_first_found(candidates, seen)
+            card = await self._pick_first_found(candidates, seen, clean)
 
         if card is None:
             raise ServiceError(
@@ -309,7 +321,7 @@ class MusicService:
         card.mode, card.topic, card.intro = mode, topic, intro
         return card
 
-    def _build_prompt(self, mode: str, topic: str, avoid: list[str]) -> str:
+    def _build_prompt(self, mode: str, topic: str, avoid: list[str], clean: bool = False) -> str:
         topic_hint = f"Пожелание пользователя: «{topic}»." if topic else ""
         body = MODE_PROMPTS[mode].format(topic=topic or "", topic_hint=topic_hint)
         if avoid:
@@ -317,6 +329,8 @@ class MusicService:
                 "\nНЕ предлагай эти треки — пользователь их уже слышал: "
                 + "; ".join(avoid)
             )
+        if clean:
+            body += f"\n{CLEAN_HINT}"
         return f"{body}\n\n{CANDIDATES_SCHEMA}"
 
     @staticmethod
@@ -338,18 +352,20 @@ class MusicService:
                 )
         return result
 
-    async def _pick_first_found(self, candidates: list[Candidate], seen: set[str]) -> TrackCard | None:
+    async def _pick_first_found(
+        self, candidates: list[Candidate], seen: set[str], clean: bool = False
+    ) -> TrackCard | None:
         # Look up all candidates concurrently, keep the LLM's order of preference.
-        found = await asyncio.gather(*(self.find_track(c, seen) for c in candidates))
+        found = await asyncio.gather(*(self.find_track(c, seen, clean) for c in candidates))
         for cand, item in zip(candidates, found):
             if item:
                 return self._to_card(item, why=cand.why)
         return None
 
     async def _pick_hit(
-        self, candidates: list[Candidate], queries: list, seen: set[str], topic: str
+        self, candidates: list[Candidate], queries: list, seen: set[str], topic: str, clean: bool = False
     ) -> TrackCard | None:
-        tasks = [self.find_track(c, seen) for c in candidates]
+        tasks = [self.find_track(c, seen, clean) for c in candidates]
         query_list = [str(q) for q in queries if isinstance(q, str) and q.strip()][:2]
         if not query_list and not candidates:
             query_list = [topic or "year:2020-2026"]
@@ -363,7 +379,7 @@ class MusicService:
         for idx, res in enumerate(results):
             items = [res] if isinstance(res, dict) else (res or [])
             for it in items:
-                if not it or not it.get("id") or it["id"] in seen:
+                if not it or not it.get("id") or it["id"] in seen or (clean and it.get("explicit")):
                     continue
                 pool.setdefault(it["id"], it)
                 if idx < len(candidates):
