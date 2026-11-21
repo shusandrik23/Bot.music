@@ -88,15 +88,27 @@ LANGS = _env_list("LANGS", [
     "Японский", "Корейский", "Турецкий", "Хинди", "Арабский", "Русский", "Украинский",
     "Шведский",
 ])
-REFS = _env_list("REFS", ["Фильмы Тарантино", "Связанные с космосом", "Саундтреки видеоигр",
-                          "Аниме", "Сериалы HBO", "Атмосфера ночного города"])
-PRESETS = {"genre": GENRES, "era": ERAS, "hits": HITS, "refs": REFS, "lang": LANGS}
+HIST = _env_list("HIST", ["Высадка на Луну", "Вудсток 1969", "Падение Берлинской стены",
+                          "Война во Вьетнаме", "Движение за гражданские права", "Распад СССР",
+                          "Холодная война", "Перестройка"])
+FILMS = _env_list("FILMS", ["Фильмы Тарантино", "Звёздные войны", "Бондиана", "Кино 80-х",
+                            "Фильмы Нолана", "Аниме", "Сериалы HBO", "Очень странные дела"])
+GAMES = _env_list("GAMES", ["GTA", "Ведьмак", "Fallout", "Need for Speed", "Ретро-игры 8-бит",
+                            "Хоррор-игры", "The Last of Us", "Инди-игры"])
+REFS = _env_list("REFS", ["Связанные с космосом", "Атмосфера ночного города", "Дорога и путешествия",
+                          "Дождливый вечер", "Книги и литература", "Море и лето"])
+REF_CATEGORIES = ["hist", "film", "game", "refs"]  # submenu of "🎬 Кино, игры и отсылки"
+PRESETS = {"genre": GENRES, "era": ERAS, "hits": HITS, "refs": REFS, "lang": LANGS,
+           "hist": HIST, "film": FILMS, "game": GAMES}
 
 INPUT_HINTS = {
     "genre": "Выберите жанр или напишите любой другой текстом 👇",
     "era": "Выберите десятилетие или напишите свою эпоху (например, «эпоха диско») 👇",
     "hits": "Выберите вариант или напишите тему/год (например, «рок 1985») 👇",
-    "refs": "Выберите тему или напишите свою: фильм, игру, книгу, атмосферу 👇",
+    "refs": "Выберите тему или напишите свою: книгу, место, настроение, атмосферу 👇",
+    "hist": "Выберите событие или напишите своё (например, «Олимпиада-80») 👇",
+    "film": "Выберите или напишите фильм, сериал или режиссёра 👇",
+    "game": "Выберите или напишите игру, серию или жанр игр 👇",
     "lang": "Выберите язык или напишите свой — можно с жанром, например «французский рэп» 👇",
 }
 
@@ -129,7 +141,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return kb([
         [(MODES["genre"], "mode:genre"), (MODES["era"], "mode:era")],
         [(MODES["hits"], "mode:hits"), (MODES["story"], "mode:story")],
-        [(MODES["refs"], "mode:refs")],
+        [("🎬 Кино, игры и отсылки", "refs_menu")],
         [(MODES["lang"], "mode:lang")],
         [(MODES["random"], "mode:random")],
         [("🎶 Плейлисты Spotify", "pl_menu"), ("🕘 История", "hist:0")],
@@ -148,8 +160,22 @@ def submenu_kb(mode: str) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append([("🔙 В главное меню", "menu")])
+    if mode in REF_CATEGORIES:
+        rows.append([("🎲 Удиви меня", f"p:{mode}:any")])
+        rows.append([("🔙 Назад", "refs_menu"), ("🏠 В меню", "menu")])
+    else:
+        rows.append([("🔙 В главное меню", "menu")])
     return kb(rows)
+
+
+def refs_menu_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [(MODES["hist"], "mode:hist")],
+        [(MODES["film"], "mode:film")],
+        [(MODES["game"], "mode:game")],
+        [(MODES["refs"], "mode:refs")],
+        [("🔙 В главное меню", "menu")],
+    ])
 
 
 def track_kb() -> InlineKeyboardMarkup:
@@ -325,10 +351,23 @@ async def cb_mode(cq: CallbackQuery, bot: Bot) -> None:
         await deliver(bot, cq.message.chat.id, cq.from_user.id, mode, "")
 
 
+@router.callback_query(F.data == "refs_menu")
+async def cb_refs_menu(cq: CallbackQuery) -> None:
+    pending_input.pop(cq.from_user.id, None)
+    await cq.answer()
+    await cq.message.answer(
+        "🎬 <b>Кино, игры и отсылки</b>\nВыберите, с чем должна быть связана музыка 👇",
+        reply_markup=refs_menu_kb(),
+    )
+
+
 @router.callback_query(F.data.startswith("p:"))
 async def cb_preset(cq: CallbackQuery, bot: Bot) -> None:
     _, mode, idx = cq.data.split(":")
     await cq.answer()
+    if idx == "any" and mode in MODES:
+        await deliver(bot, cq.message.chat.id, cq.from_user.id, mode, "")
+        return
     try:
         topic = PRESETS[mode][int(idx)]
     except (KeyError, ValueError, IndexError):
