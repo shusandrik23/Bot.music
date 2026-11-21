@@ -25,7 +25,8 @@ log = logging.getLogger(__name__)
 
 SCOPES = (
     "playlist-read-private playlist-read-collaborative "
-    "playlist-modify-private playlist-modify-public"
+    "playlist-modify-private playlist-modify-public "
+    "user-library-read"  # saved podcasts (shows)
 )
 
 PLAYLIST_URL_RE = re.compile(r"(?:open\.spotify\.com/(?:intl-\w+/)?playlist/|spotify:playlist:)([A-Za-z0-9]{22})")

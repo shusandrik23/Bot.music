@@ -32,6 +32,7 @@ load_dotenv()
 
 import database as db  # noqa: E402  (DB_PATH is read from env after load_dotenv)
 from playlists import Analysis, PlaylistService, extract_playlist_id  # noqa: E402
+from podcasts import PodcastService  # noqa: E402
 from services import MODES, MusicService, ServiceError, TrackCard  # noqa: E402
 
 logging.basicConfig(
@@ -63,6 +64,7 @@ playlists = PlaylistService(
     # e.g. https://your-bot.onrender.com/spotify/callback (must also be added in the Spotify dashboard)
     redirect_uri=os.environ.get("SPOTIFY_REDIRECT_URI", "").strip(),
 )
+podcasts = PodcastService(service, playlists)
 
 router = Router()
 
@@ -143,6 +145,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [(MODES["hits"], "mode:hits"), (MODES["story"], "mode:story")],
         [("🎬 Кино, игры и отсылки", "refs_menu")],
         [(MODES["lang"], "mode:lang")],
+        [("🎙 Подкасты", "pod_menu")],
         [(MODES["random"], "mode:random")],
         [("🎶 Плейлисты Spotify", "pl_menu"), ("🕘 История", "hist:0")],
         [("⏰ Ежедневная рассылка (1-3 в день)", "sub_menu")],
@@ -312,6 +315,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Команды:\n/start — главное меню\n/random — случайный трек\n"
         "/subscribe — ежедневная рассылка\n/playlists — плейлисты Spotify\n"
+        "/podcasts — подкасты: анализ вкуса и рекомендации\n"
         "/settings — настройки (фильтр нецензурной лексики)\n"
         "/history — история треков (или просто напишите «история»)\n"
         "/connect — подключить Spotify\n/disconnect — отключить Spotify\n\n"
@@ -857,6 +861,141 @@ async def cb_history_clear_yes(cq: CallbackQuery) -> None:
         await cq.message.answer("🗑 История очищена.", reply_markup=main_menu_kb())
 
 
+# ---------------------------------------------------------------- podcasts
+
+# user_id -> ("mine" | "list" | "topic", text) for "🔄 Ещё рекомендации"
+last_podcast_request: dict[int, tuple[str, str]] = {}
+
+
+def podcasts_menu_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [("📂 Анализ моих подкастов из Spotify", "pod_mine")],
+        [("✍️ Назвать любимые подкасты", "pod_list")],
+        [("🔎 Подкаст на тему", "pod_topic")],
+        [("🔙 В главное меню", "menu")],
+    ])
+
+
+def format_podcasts(res, title: str) -> str:
+    e = html.escape
+    parts = [f"🎙 <b>{e(title)}</b>"]
+    if res.profile:
+        parts.append(e(_cut(res.profile, 1200)))
+    if res.themes:
+        parts.append("🏷 Темы: " + e(", ".join(res.themes)))
+    if res.intro:
+        parts.append(e(_cut(res.intro, 600)))
+    lines = ["💡 <b>Вам может понравиться:</b>"]
+    for i, r in enumerate(res.recs, 1):
+        who = f" · {e(r.publisher)}" if r.publisher else ""
+        why = f"\n      {e(_cut(r.why, 200))}" if r.why else ""
+        lines.append(f'{i}. <a href="{e(r.url)}">{e(r.name)}</a>{who}{why}')
+    parts.append("\n".join(lines))
+    return _cut("\n\n".join(parts), 4000)
+
+
+def podcast_result_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [("🔄 Ещё рекомендации", "pod_more")],
+        [("🎙 Подкасты", "pod_menu"), ("🔙 В меню", "menu")],
+    ])
+
+
+async def run_podcasts(bot: Bot, chat_id: int, user_id: int, kind: str, text: str = "") -> None:
+    pending_input.pop(user_id, None)
+    if kind == "mine":
+        if not playlists.enabled or not await playlists.is_connected(user_id):
+            await ask_spotify_connect_for_podcasts(bot, chat_id, user_id)
+            return
+        factory, title = (lambda: podcasts.analyze(user_id)), "Ваши подкасты"
+    elif kind == "list":
+        factory, title = (lambda: podcasts.analyze(user_id, typed=text)), "Ваш вкус в подкастах"
+    else:
+        factory, title = (lambda: podcasts.by_topic(user_id, text)), f"Подкасты: {text}"
+    res = await run_playlist_task(bot, chat_id, user_id, "🎙 Изучаю подкасты…", factory)
+    if not res:
+        return
+    last_podcast_request[user_id] = (kind, text)
+    if kind == "mine":
+        title = f"Ваши подкасты ({res.source_count})"
+    await bot.send_message(
+        chat_id, format_podcasts(res, title), reply_markup=podcast_result_kb(),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def ask_spotify_connect_for_podcasts(bot: Bot, chat_id: int, user_id: int) -> None:
+    text = (
+        "📂 Чтобы проанализировать подкасты из вашей библиотеки, нужно подключить Spotify.\n\n"
+        "Или нажмите «✍️ Назвать любимые подкасты» и просто перечислите их сообщением — "
+        "это работает без входа в Spotify."
+    )
+    rows = []
+    if playlists.enabled:
+        url = await playlists.auth_url(user_id)
+        rows.append([InlineKeyboardButton(text="🔗 Подключить Spotify", url=url)])
+    rows.append([InlineKeyboardButton(text="✍️ Назвать любимые подкасты", callback_data="pod_list")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="pod_menu")])
+    await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(Command("podcasts"))
+async def cmd_podcasts(message: Message) -> None:
+    pending_input.pop(message.from_user.id, None)
+    await message.answer(PODCASTS_INTRO, reply_markup=podcasts_menu_kb())
+
+
+PODCASTS_INTRO = (
+    "🎙 <b>Подкасты</b>\n\n"
+    "Проанализирую, какие подкасты вам нравятся, и подберу новые — со ссылками на Spotify."
+)
+
+
+@router.callback_query(F.data == "pod_menu")
+async def cb_pod_menu(cq: CallbackQuery) -> None:
+    pending_input.pop(cq.from_user.id, None)
+    await cq.answer()
+    await cq.message.answer(PODCASTS_INTRO, reply_markup=podcasts_menu_kb())
+
+
+@router.callback_query(F.data == "pod_mine")
+async def cb_pod_mine(cq: CallbackQuery, bot: Bot) -> None:
+    await cq.answer()
+    await run_podcasts(bot, cq.message.chat.id, cq.from_user.id, "mine")
+
+
+@router.callback_query(F.data == "pod_list")
+async def cb_pod_list(cq: CallbackQuery) -> None:
+    await cq.answer()
+    pending_input[cq.from_user.id] = "pod_list"
+    await cq.message.answer(
+        "✍️ Перечислите подкасты, которые вам нравятся — через запятую или каждый с новой строки. "
+        "Например: <i>Arzamas, Подкаст Лайфхакера, The Joe Rogan Experience</i>",
+        reply_markup=kb([[("🔙 Назад", "pod_menu")]]),
+    )
+
+
+@router.callback_query(F.data == "pod_topic")
+async def cb_pod_topic(cq: CallbackQuery) -> None:
+    await cq.answer()
+    pending_input[cq.from_user.id] = "pod_topic"
+    await cq.message.answer(
+        "🔎 О чём должен быть подкаст? Например: <i>про космос</i>, <i>true crime на русском</i>, "
+        "<i>история музыки</i>, <i>бизнес и стартапы</i>",
+        reply_markup=kb([[("🔙 Назад", "pod_menu")]]),
+    )
+
+
+@router.callback_query(F.data == "pod_more")
+async def cb_pod_more(cq: CallbackQuery, bot: Bot) -> None:
+    await cq.answer()
+    last = last_podcast_request.get(cq.from_user.id)
+    if not last:
+        await cq.message.answer(PODCASTS_INTRO, reply_markup=podcasts_menu_kb())
+        return
+    await run_podcasts(bot, cq.message.chat.id, cq.from_user.id, *last)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id
@@ -871,6 +1010,9 @@ async def on_text(message: Message, bot: Bot) -> None:
     if mode == "playlist":
         await create_playlist(bot, message.chat.id, user_id, text)
         return
+    if mode in ("pod_list", "pod_topic"):
+        await run_podcasts(bot, message.chat.id, user_id, mode[4:], raw[:1500])
+        return
     if mode:
         await deliver(bot, message.chat.id, user_id, mode, text)
         return
@@ -882,6 +1024,9 @@ async def on_text(message: Message, bot: Bot) -> None:
         return
     if mode == "playlist":
         await create_playlist(bot, message.chat.id, user_id, topic)
+        return
+    if mode == "podcast":
+        await run_podcasts(bot, message.chat.id, user_id, "topic", topic)
         return
     await deliver(bot, message.chat.id, user_id, mode, topic)
 
