@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import spotipy
 from google import genai
@@ -37,7 +39,11 @@ MODES: dict[str, str] = {
     "era": "🕰 Эпохи",
     "hits": "🔥 Главные хиты",
     "story": "📜 Трек с историей",
-    "refs": "🎬 Кино, игры и отсылки",
+    "hist": "🏛 История в песнях",
+    "film": "🎬 Кино и сериалы",
+    "game": "🎮 Музыка из игр",
+    "refs": "✨ Темы и атмосфера",
+    "lang": "🌍 Музыка на языке",
     "random": "🎲 Случайный трек",
 }
 
@@ -47,8 +53,17 @@ TEMPERATURES = {
     "hits": 0.7,
     "story": 1.0,
     "refs": 0.9,
+    "hist": 0.8,
+    "film": 0.9,
+    "game": 0.9,
+    "lang": 0.9,
     "random": 1.2,
 }
+
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+             "сентября", "октября", "ноября", "декабря"]
+MONTHS_RU_NOM = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август",
+                 "сентябрь", "октябрь", "ноябрь", "декабрь"]
 
 SYSTEM_PROMPT = (
     "Ты — эрудированный музыкальный журналист и диджей. Пишешь по-русски, живо и "
@@ -98,6 +113,30 @@ MODE_PROMPTS: dict[str, str] = {
         "candidates — 3 разные песни. why — сама история (3-5 предложений), "
         "только проверенные факты, без выдумок."
     ),
+    "hist": (
+        "Пользователь хочет музыку, связанную с историческим событием: {subject}.\n"
+        "Подбери реальные песни, которые написаны об этом событии, стали его гимном или "
+        "символом, звучали в те дни или прямо на нём, либо отражают дух того времени.\n"
+        "intro — 2-3 предложения: что это было за событие и какую роль в нём сыграла музыка.\n"
+        "candidates — 6 треков. why — 1-2 предложения о конкретной связи песни с событием "
+        "(только проверенные факты, без выдумок)."
+    ),
+    "film": (
+        "Пользователь хочет музыку из кино или сериалов: {subject}.\n"
+        "Подбери реальные треки из саундтреков: песни из запоминающихся сцен, главные темы, "
+        "композиции, которые стали культовыми благодаря фильму/сериалу.\n"
+        "intro — 1-2 предложения о фильме/сериале/режиссёре и роли музыки в нём.\n"
+        "candidates — 6 треков, которые есть на Spotify. why — 1-2 предложения: в каком "
+        "фильме и в какой сцене звучит трек (без спойлеров концовки)."
+    ),
+    "game": (
+        "Пользователь хочет музыку из видеоигр: {subject}.\n"
+        "Подбери реальные треки: саундтреки игр, лицензированные песни из игр (радио в GTA, "
+        "плейлисты гонок и т.п.), главные темы и композиции, ставшие культовыми.\n"
+        "intro — 1-2 предложения об игре/серии/жанре и её музыке.\n"
+        "candidates — 6 треков, которые есть на Spotify. why — 1-2 предложения: в какой "
+        "игре и в какой момент звучит трек."
+    ),
     "refs": (
         "Пользователь ищет музыку, связанную с темой/отсылкой: «{topic}» "
         "(фильмы, сериалы, игры, книги, атмосфера).\n"
@@ -105,6 +144,14 @@ MODE_PROMPTS: dict[str, str] = {
         "candidates — 6 реальных треков, связанных с темой (саундтреки, песни "
         "из сцен, песни-отсылки, композиции нужной атмосферы). why — 1-2 "
         "предложения: где звучал трек или как он связан с темой."
+    ),
+    "lang": (
+        "Пользователь хочет музыку на определённом языке: «{topic}».\n"
+        "Песни должны быть СПЕТЫ на этом языке (если в запросе есть жанр или настроение — "
+        "учти и их). Разные исполнители и эпохи: и классика, и современные артисты.\n"
+        "intro — 1-2 предложения о музыкальной сцене этого языка.\n"
+        "candidates — 6 реальных треков на этом языке. why — 1-2 предложения: кто "
+        "исполнитель и чем цепляет песня (можно кратко, о чём она)."
     ),
     "random": (
         "Музыкальная рулетка! Удиви пользователя неожиданной находкой со всего "
@@ -122,12 +169,62 @@ ROUTER_PROMPT = """Определи, какую музыку хочет поль
 - era: десятилетие или эпоха (topic = например "1980-е" или "эпоха диско")
 - hits: самые популярные/главные хиты (topic = тема, год или пусто)
 - story: песня с интересной историей создания или скрытым смыслом (topic = уточнение или пусто)
-- refs: музыка из фильмов, сериалов, игр, книг или про атмосферу/тему (topic = тема)
+- hist: музыка, связанная с историческим событием или периодом истории (topic = событие)
+- film: музыка из фильмов или сериалов, саундтреки, режиссёры (topic = фильм/сериал/режиссёр)
+- game: музыка из видеоигр (topic = игра, серия или жанр игр)
+- refs: музыка про тему или атмосферу, книги и прочие отсылки (topic = тема)
+- lang: музыка на определённом языке (topic = язык, можно с жанром, например "французский рэп")
 - random: случайный/неожиданный трек (topic = пусто)
 - playlist: пользователь просит СОЗДАТЬ/собрать плейлист (topic = описание плейлиста целиком, с количеством треков, если указано)
 Если запрос не подходит ни под один режим, но связан с музыкой или настроением — выбери refs.
 Запрос пользователя: «{text}»
 Ответ JSON: {{"mode": "...", "topic": "..."}}"""
+
+
+def _now() -> datetime:
+    offset = float(os.environ.get("TIMEZONE_OFFSET", "3"))
+    return datetime.now(timezone(timedelta(hours=offset)))
+
+
+def _today_hint() -> str:
+    d = _now()
+    return f"Сегодня {d.day} {MONTHS_RU[d.month - 1]} {d.year} года."
+
+
+def _hits_period(topic: str) -> str | None:
+    """'month' / 'year' when the user asks for the current month's or year's hits."""
+    t = (topic or "").lower()
+    now = _now()
+    month_names = (MONTHS_RU[now.month - 1], MONTHS_RU_NOM[now.month - 1][:-1] or MONTHS_RU_NOM[now.month - 1])
+    if "месяц" in t or any(m in t for m in month_names):
+        return "month"
+    year = str(now.year)
+    if year in t or ("год" in t and any(w in t for w in ("этот", "этого", "текущ", "нынеш"))):
+        return "year"
+    return None
+
+
+def _fresh_hits_prompt(period: str, topic: str) -> str:
+    d = _now()
+    when = (
+        f"за {MONTHS_RU_NOM[d.month - 1]} {d.year} года (этот месяц)"
+        if period == "month"
+        else f"за {d.year} год (с начала года до сегодня)"
+    )
+    extra = ""
+    t = (topic or "").lower()
+    if t and not any(w in t for w in ("хиты этого", "хиты за")):
+        extra = f" Учти уточнение пользователя: «{topic}»."
+    return (
+        f"Пользователь хочет самые популярные треки {when}.{extra}\n"
+        "Используй поиск Google: найди актуальные чарты (Spotify Top 50 Global, Billboard "
+        "Hot 100, Apple Music Top 100 и т.п.) именно за этот период и опирайся на них, а не "
+        "на старые знания.\n"
+        "intro — 1-2 предложения: что сейчас на вершине чартов и почему.\n"
+        "candidates — 10 самых популярных треков этого периода, по убыванию популярности. "
+        "why — 1 предложение о треке (например, позиция в чарте или чем он выстрелил).\n"
+        "Ответь ТОЛЬКО JSON-объектом, без пояснений вокруг."
+    )
 
 
 CLEAN_HINT = (
@@ -264,7 +361,9 @@ class MusicService:
             log.info("Gemini model chain: %s", ", ".join(chain))
         return self._chain
 
-    def _gen_config(self, model: str, temperature: float) -> types.GenerateContentConfig:
+    def _gen_config(
+        self, model: str, temperature: float, search: bool = False
+    ) -> types.GenerateContentConfig:
         thinking = None
         if model not in self._no_thinking_cfg:
             # Long "thinking" makes answers take tens of seconds; music tips don't need it.
@@ -274,13 +373,17 @@ class MusicService:
                 thinking = types.ThinkingConfig(thinking_budget=0)
         return types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
+            # Google Search grounding can't be combined with JSON mode on every model:
+            # with search on we ask for JSON in the prompt and parse it leniently.
+            response_mime_type=None if search else "application/json",
+            tools=[types.Tool(google_search=types.GoogleSearch())] if search else None,
             temperature=temperature,
             thinking_config=thinking,
             http_options=types.HttpOptions(timeout=int(GEMINI_CALL_TIMEOUT * 1000)),
         )
 
-    async def _ask_json(self, prompt: str, temperature: float) -> dict:
+    async def _ask_json(self, prompt: str, temperature: float, search: bool = False) -> dict:
+        """Ask Gemini for JSON. search=True lets the model use Google Search (fresh charts)."""
         deadline = time.monotonic() + GEMINI_TOTAL_BUDGET
         chain = [m for m in await self._model_chain() if m not in self._dead_models]
         now = time.monotonic()
@@ -308,7 +411,7 @@ class MusicService:
                             self.gemini.aio.models.generate_content(
                                 model=model,
                                 contents=prompt,
-                                config=self._gen_config(model, temperature),
+                                config=self._gen_config(model, temperature, search),
                             ),
                             timeout=min(GEMINI_CALL_TIMEOUT, remaining),
                         )
@@ -332,6 +435,11 @@ class MusicService:
                             "Gemini недоступен из региона сервера. Пересоздайте сервис на Render "
                             "в регионе Oregon (US West)."
                         ) from exc
+                    if search and code in (400, 429):
+                        # Grounding unsupported or its quota is used up: answer from knowledge.
+                        log.info("Google Search grounding unavailable (%s), retrying without it", code)
+                        search = False
+                        continue
                     if code == 400 and "think" in text.lower() and model not in self._no_thinking_cfg:
                         # This model does not accept our thinking settings: retry without them.
                         self._no_thinking_cfg.add(model)
@@ -469,13 +577,21 @@ class MusicService:
         clean = await db.get_no_explicit(user_id)
         avoid = await db.recent_labels(user_id)
 
-        prompt = self._build_prompt(mode, topic, avoid, clean)
-        data = await self._ask_json(prompt, TEMPERATURES[mode])
+        period = _hits_period(topic) if mode == "hits" else None
+        prompt = self._build_prompt(mode, topic, avoid, clean, period)
+        data = await self._ask_json(prompt, TEMPERATURES[mode], search=period is not None)
         intro = str(data.get("intro", "") or "").strip()
         candidates = self._parse_candidates(data)
 
         if mode == "hits":
-            card = await self._pick_hit(candidates, data.get("queries") or [], seen, topic, clean)
+            queries = data.get("queries") or []
+            year_only = None
+            if period:
+                # Fresh hits: rely on the charts Gemini found; for "this year" also take
+                # this year's releases from Spotify search.
+                queries = [f"year:{_now().year}"] if period == "year" else []
+                year_only = _now().year if period == "year" else None
+            card = await self._pick_hit(candidates, queries, seen, topic, clean, year_only)
         else:
             card = await self._pick_first_found(candidates, seen, clean)
 
@@ -492,9 +608,19 @@ class MusicService:
         card.mode, card.topic, card.intro = mode, topic, intro
         return card
 
-    def _build_prompt(self, mode: str, topic: str, avoid: list[str], clean: bool = False) -> str:
+    def _build_prompt(
+        self, mode: str, topic: str, avoid: list[str], clean: bool = False, period: str | None = None
+    ) -> str:
         topic_hint = f"Пожелание пользователя: «{topic}»." if topic else ""
-        body = MODE_PROMPTS[mode].format(topic=topic or "", topic_hint=topic_hint)
+        if period:
+            body = _fresh_hits_prompt(period, topic)
+        else:
+            subject = (
+                f"«{topic}»" if topic
+                else "на твой выбор — возьми что-нибудь интересное и не самое очевидное"
+            )
+            body = MODE_PROMPTS[mode].format(topic=topic or "", topic_hint=topic_hint, subject=subject)
+        body = f"{_today_hint()}\n{body}"
         if avoid:
             body += (
                 "\nНЕ предлагай эти треки — пользователь их уже слышал: "
@@ -534,7 +660,13 @@ class MusicService:
         return None
 
     async def _pick_hit(
-        self, candidates: list[Candidate], queries: list, seen: set[str], topic: str, clean: bool = False
+        self,
+        candidates: list[Candidate],
+        queries: list,
+        seen: set[str],
+        topic: str,
+        clean: bool = False,
+        year_only: int | None = None,
     ) -> TrackCard | None:
         tasks = [self.find_track(c, seen, clean) for c in candidates]
         query_list = [str(q) for q in queries if isinstance(q, str) and q.strip()][:2]
@@ -551,6 +683,12 @@ class MusicService:
             items = [res] if isinstance(res, dict) else (res or [])
             for it in items:
                 if not it or not it.get("id") or it["id"] in seen or (clean and it.get("explicit")):
+                    continue
+                if (
+                    year_only
+                    and idx >= len(candidates)  # search-query results (not chart candidates)
+                    and not str((it.get("album") or {}).get("release_date", "")).startswith(str(year_only))
+                ):
                     continue
                 pool.setdefault(it["id"], it)
                 if idx < len(candidates):
