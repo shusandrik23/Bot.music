@@ -67,12 +67,23 @@ playlists = PlaylistService(
 router = Router()
 
 # Submenu presets: (button label, topic sent to the LLM)
-GENRES = ["Джаз", "Синтвейв", "Пост-панк", "Трип-хоп", "Неоклассика",
-          "Олдскул Хип-хоп", "Босса-нова", "Драм-н-бэйс"]
-ERAS = ["1960-е", "1970-е", "1980-е", "1990-е", "2000-е", "2010-е"]
-HITS = ["Хиты всех времён", "Хиты 80-х", "Хиты 90-х", "Хиты 2000-х", "Хиты этого десятилетия"]
-REFS = ["Фильмы Тарантино", "Связанные с космосом", "Саундтреки видеоигр",
-        "Аниме", "Сериалы HBO", "Атмосфера ночного города"]
+def _env_list(name: str, default: list[str]) -> list[str]:
+    """Comma-separated list from an environment variable (to edit menus on Render without code)."""
+    raw = os.environ.get(name, "")
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items[:40] if items else default
+
+
+GENRES = _env_list("GENRES", [
+    "Рок", "Поп", "Хип-хоп", "Электроника", "Инди", "Метал", "Синтвейв",
+    "Пост-панк", "Трип-хоп", "Неоклассика", "Олдскул Хип-хоп", "Босса-нова",
+    "Драм-н-бэйс", "K-pop",
+])
+ERAS = _env_list("ERAS", ["1960-е", "1970-е", "1980-е", "1990-е", "2000-е", "2010-е"])
+HITS = _env_list("HITS", ["Хиты всех времён", "Хиты 80-х", "Хиты 90-х", "Хиты 2000-х",
+                          "Хиты этого десятилетия"])
+REFS = _env_list("REFS", ["Фильмы Тарантино", "Связанные с космосом", "Саундтреки видеоигр",
+                          "Аниме", "Сериалы HBO", "Атмосфера ночного города"])
 PRESETS = {"genre": GENRES, "era": ERAS, "hits": HITS, "refs": REFS}
 
 INPUT_HINTS = {
