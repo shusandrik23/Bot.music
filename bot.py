@@ -889,8 +889,11 @@ def format_podcasts(res, title: str) -> str:
     for i, r in enumerate(res.recs, 1):
         who = f" · {e(r.publisher)}" if r.publisher else ""
         why = f"\n      {e(_cut(r.why, 200))}" if r.why else ""
-        lines.append(f'{i}. <a href="{e(r.url)}">{e(r.name)}</a>{who}{why}')
+        mark = "" if r.found else " 🔎"
+        lines.append(f'{i}. <a href="{e(r.url)}">{e(r.name)}</a>{who}{mark}{why}')
     parts.append("\n".join(lines))
+    if any(not r.found for r in res.recs):
+        parts.append("<i>🔎 — не нашёл точную страницу, ссылка ведёт на поиск в Spotify.</i>")
     return _cut("\n\n".join(parts), 4000)
 
 

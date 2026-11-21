@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 import spotipy
 
@@ -21,8 +22,13 @@ from services import CLEAN_HINT, MusicService, ServiceError, _norm, _today_hint
 
 log = logging.getLogger(__name__)
 
-# Spotify needs a market for show search with an app-only token.
-MARKET = os.environ.get("SPOTIFY_MARKET", "US").strip().upper() or "US"
+# Spotify needs a market (country) for show search with an app-only token. Podcasts are
+# licensed per country, so several markets are tried in order.
+MARKETS = [
+    m.strip().upper()
+    for m in (os.environ.get("SPOTIFY_MARKETS") or os.environ.get("SPOTIFY_MARKET") or "US,DE,KZ").split(",")
+    if m.strip()
+][:4] or ["US"]
 
 ANALYZE_PROMPT = """{today}
 Вот подкасты, которые слушает пользователь:
@@ -52,6 +58,7 @@ class PodcastRec:
     url: str
     why: str = ""
     episodes: int | None = None
+    found: bool = True  # False: not found by search, url is a Spotify search link
 
 
 @dataclass
@@ -88,35 +95,56 @@ class PodcastService:
 
     # --------------------------------------------------------------- search
 
-    async def _find_show(self, title: str, publisher: str, sp: spotipy.Spotify, market: str,
+    @staticmethod
+    def _title_matches(want: str, got: str) -> bool:
+        if not want or not got:
+            return False
+        if want in got or got in want:
+            return True
+        w, g = set(want.split()), set(got.split())
+        return bool(w) and len(w & g) / len(w) >= 0.6
+
+    async def _find_show(self, title: str, publisher: str, sp: spotipy.Spotify, markets: list[str],
                          exclude: set[str], clean: bool) -> dict | None:
-        def _do(q: str) -> list[dict]:
+        def _do(q: str, market: str) -> list[dict]:
             res = sp.search(q=q, type="show", limit=5, market=market)
             return [s for s in ((res or {}).get("shows", {}).get("items") or []) if s]
 
-        want = _norm(title)
-        for q in (f"{title} {publisher}".strip(), title):
-            try:
-                async with self._sem:
-                    items = await asyncio.to_thread(_do, q)
-            except Exception as exc:
-                log.warning("Spotify show search failed for %r: %s", q, exc)
-                return None
-            for s in items:
-                got = _norm(s.get("name", ""))
-                if s.get("id") in exclude or (clean and s.get("explicit")):
+        want, want_pub = _norm(title), _norm(publisher)
+        for n, market in enumerate(markets):
+            # Shows are licensed per country: if not found in one market, try the next.
+            queries = [f"{title} {publisher}".strip(), title] if n == 0 else [title]
+            for q in dict.fromkeys(queries):
+                try:
+                    async with self._sem:
+                        items = await asyncio.to_thread(_do, q, market)
+                except spotipy.SpotifyException as exc:
+                    log.warning("Spotify show search failed for %r (%s): %s", q, market, exc)
+                    if exc.http_status == 429:
+                        return None
                     continue
-                if want and got and (want in got or got in want):
-                    return s
+                except Exception as exc:
+                    log.warning("Spotify show search failed for %r (%s): %s", q, market, exc)
+                    continue
+                for s in items:
+                    if s.get("id") in exclude or (clean and s.get("explicit")):
+                        continue
+                    got = _norm(s.get("name", ""))
+                    pub = _norm(s.get("publisher", ""))
+                    if self._title_matches(want, got) or (
+                        want_pub and pub and want_pub in pub and self._title_matches(want, got + " " + pub)
+                    ):
+                        return s
+        log.info("Podcast not found on Spotify: %r / %r (markets %s)", title, publisher, markets)
         return None
 
     async def _resolve(self, user_id: int, recs: list, exclude_ids: set[str],
                        exclude_names: set[str]) -> list[PodcastRec]:
         clean = await db.get_no_explicit(user_id)
         if await self.playlists.is_connected(user_id):
-            sp, market = await self.playlists._client(user_id), "from_token"
+            sp, markets = await self.playlists._client(user_id), ["from_token", *MARKETS]
         else:
-            sp, market = self.music.sp, MARKET
+            sp, markets = self.music.sp, MARKETS
 
         wanted = []
         for r in recs:
@@ -127,12 +155,23 @@ class PodcastService:
             wanted.append(r)
 
         found = await asyncio.gather(*(
-            self._find_show(str(r["title"]), str(r.get("publisher", "")), sp, market, exclude_ids, clean)
+            self._find_show(str(r["title"]), str(r.get("publisher", "")), sp, markets, exclude_ids, clean)
             for r in wanted[:8]
         ))
         result, used = [], set()
         for r, show in zip(wanted, found):
-            if show and show["id"] not in used:
+            if not show:
+                # Not found in the searched markets: still recommend it, with a Spotify search link.
+                title = str(r["title"])
+                result.append(PodcastRec(
+                    name=title,
+                    publisher=str(r.get("publisher", "") or ""),
+                    url="https://open.spotify.com/search/" + quote(title) + "/podcasts",
+                    why=str(r.get("why", "") or ""),
+                    found=False,
+                ))
+                continue
+            if show["id"] not in used:
                 used.add(show["id"])
                 result.append(PodcastRec(
                     name=show.get("name", r["title"]),
@@ -191,7 +230,7 @@ class PodcastService:
             user_id, data.get("recommendations") or [], exclude_ids, {_norm(n) for n in names}
         )
         if not recs:
-            raise ServiceError("Не нашёл подходящих подкастов в Spotify, попробуйте ещё раз.")
+            raise ServiceError("Нейросеть не предложила подкасты, попробуйте ещё раз.")
         return PodcastResult(
             profile=str(data.get("profile", "") or ""),
             themes=[str(t) for t in data.get("themes") or []][:6],
@@ -207,5 +246,5 @@ class PodcastService:
         )
         recs = await self._resolve(user_id, data.get("recommendations") or [], set(), set())
         if not recs:
-            raise ServiceError("Не нашёл подходящих подкастов в Spotify, попробуйте другую тему.")
+            raise ServiceError("Нейросеть не предложила подкасты, попробуйте другую тему.")
         return PodcastResult(intro=str(data.get("intro", "") or ""), recs=recs)
