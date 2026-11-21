@@ -24,7 +24,7 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
 )
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -931,6 +931,25 @@ async def start_health_server(bot: Bot) -> web.AppRunner:
     return runner
 
 
+# ------------------------------------------------------------- keep-alive
+
+# Free Render services sleep after ~15 min without incoming HTTP traffic, and a
+# sleeping bot does not receive Telegram messages. Pinging our own public URL
+# every 10 minutes counts as traffic and keeps the bot awake (no UptimeRobot needed).
+KEEPALIVE_URL = (
+    os.environ.get("KEEPALIVE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+).strip().rstrip("/")
+
+
+async def keep_alive() -> None:
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+            async with session.get(f"{KEEPALIVE_URL}/health") as resp:
+                log.debug("Keep-alive ping: %s", resp.status)
+    except Exception as exc:
+        log.warning("Keep-alive ping failed: %r", exc)
+
+
 async def main() -> None:
     await db.init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -939,9 +958,13 @@ async def main() -> None:
 
     runner = await start_health_server(bot)
     scheduler = setup_scheduler(bot)
+    if KEEPALIVE_URL:
+        scheduler.add_job(keep_alive, "interval", minutes=10, max_instances=1, coalesce=True)
+        log.info("Keep-alive enabled: %s/health every 10 min", KEEPALIVE_URL)
     scheduler.start()
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        # Keep messages sent while the bot was restarting/asleep and answer them.
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown(wait=False)

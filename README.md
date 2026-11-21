@@ -65,7 +65,10 @@ python bot.py
    - Environment Variables: `BOT_TOKEN`, `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`,
      `GEMINI_API_KEY`, `SPOTIFY_REDIRECT_URI`, `TIMEZONE_OFFSET` (по умолчанию `3`), при желании `PYTHON_VERSION=3.12.8`.
 3. После деплоя скопируйте адрес вида `https://ваш-бот.onrender.com` — по `GET /` бот отвечает `200 OK`.
-4. [uptimerobot.com](https://uptimerobot.com) → **Add New Monitor → HTTP(s)** → этот адрес, интервал 5 минут,
+4. Засыпать бот не будет: на Render он сам каждые 10 минут открывает свой адрес
+   (`RENDER_EXTERNAL_URL` Render подставляет автоматически), и Render видит активность.
+   На другом хостинге укажите адрес в `KEEPALIVE_URL` или используйте внешний пингер:
+   [uptimerobot.com](https://uptimerobot.com) → **Add New Monitor → HTTP(s)** → этот адрес, интервал 5 минут,
    чтобы Render не усыплял сервис.
 
 > ⚠️ Диск бесплатного Render-инстанса не постоянный: `bot_data.db` (история и подписки)
